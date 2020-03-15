@@ -1,0 +1,246 @@
+---
+title: "Data 612 - Project 3"
+author: "Peter Kowalchuk"
+date: "3/14/2020"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE,warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(recommenderlab)
+library(kableExtra)
+```
+
+#Introduction
+
+In this project we will work with item rated data from Amazon. Data has been made available by Julian McAuley from UCSD. Several different dataset with up to 142.8 million reviews are available. Data includes user ID, item ID and reviews given by the a user to a item. The goal of this project is to build a model using Single Value Decomposition (SVD), to them be able to both recommend items to users who have already made reviews. A second use of the model is to be able to find items which belong to the same group/topic/concept as a selected item. This could be used to recommend items to a user who is browsing a specific item. Could be a way of providing recommendations to users who has not rated any items.
+
+#Data
+
+Datasets are available on Julian McAuley's site: http://jmcauley.ucsd.edu/data/amazon/links.html
+
+These dataset are fairly large, some with several million reviews. To keep the data manageable on a single computer, a rather small dataset was selected. The Digital Music dataset contains reviews for different musical products such as vinyl records, CD, and  music literature.
+
+![](i1.png)
+
+![](i2.png)
+
+![](i3.png)
+
+In the dataset each user and item are represented by a code. The dataset also contain a column for a timestamp for the rating, but this data was not used of loaded. Out of all of the available reviews, the data load was limited to 40k reviews to keep processing times in check.
+
+```{r}
+data <- read.csv("ratings_Digital_Music.csv", header = FALSE,colClasses=c("character","character","character","NULL"))[1:40000,]
+colnames(data)<-c('user','item','rating')
+head(data) %>% kable() %>% kable_styling() %>% scroll_box(width = "800px", height = "400px")
+```
+
+#Utility Matrix
+
+First step was to convert the data loaded into a utility matrix. Here instead of having a row for each user-item reviews, we require a matrix with rows for all users, and columns for all items.
+
+```{r}
+numberOfUsers<-length(unique(data[["user"]]))
+numberOfItems<-length(unique(data[["item"]]))
+utilMatrix<-data.frame(matrix(NA, ncol = numberOfItems, nrow = numberOfUsers))
+colnames(utilMatrix)<-unique(data[["item"]])
+rownames(utilMatrix)<-unique(data[["user"]])
+for(i in 1:nrow(data)) {
+  utilMatrix[data[i,1],data[i,2]]<-data[i,3]
+}
+head(utilMatrix,20) %>% kable() %>% kable_styling() %>% scroll_box(width = "800px", height = "400px")
+rm(data,i)
+```
+
+#Data Exploration
+
+In this project we will use data in base R matrix form, but to do data expoloration we will make use of the sparse data class in the recommenderlab library.
+
+```{r}
+utilityRatingMatrix <- as(as.matrix(utilMatrix), "realRatingMatrix")
+```
+
+We start by looking at what is the distribution of the rating in the data. This with the goal to see if we have a good distribution of rating, and if the ratings are in aggregate skewed to either high or low.
+
+```{r}
+plot(factor(as.vector(utilityRatingMatrix@data)[as.vector(utilityRatingMatrix@data)!=0]))
+```
+
+```{r}
+utilMatrix<-data.matrix(utilMatrix)
+table(as.vector(utilMatrix))
+```
+
+We do see entries for each rating, but we also see how the data is skewed to the high side. We see a similar skew in the ratings histogram.
+
+```{r}
+averageRatings<-colMeans(utilityRatingMatrix)
+hist(averageRatings,breaks = 30)
+```
+
+#Data Preparetion
+
+As seen in the data exploration exercise, ratings are heavily weighted towards 5. For this reason we will normalize for each users ratings, and at the same time centralize our data around 0. This has the extra benefits of providing a way to handle missing ratings, NA's. Simply setting NA's to zero will imply a low rating, by centralizing at zero we change NA's to a neutral rating.
+
+##Normilize Utility Matrix
+
+```{r}
+meanUtilMatrix<-mean(utilMatrix, na.rm = T)
+userBias<-unname(rowMeans(utilMatrix, na.rm=T))-meanUtilMatrix
+userBiasMatrix<-matrix(userBias,nrow=nrow(utilMatrix),ncol=ncol(utilMatrix))
+itemBias<-unname(colMeans(utilMatrix, na.rm=T))-meanUtilMatrix
+itemBiasMatrix<-matrix(itemBias, nrow=nrow(utilMatrix), ncol=ncol(utilMatrix), byrow=T)
+baseline<-meanUtilMatrix+userBiasMatrix+itemBiasMatrix
+utilMatrixNorm<-data.frame(utilMatrix-baseline)
+utilMatrixNorm[is.na(utilMatrixNorm)]<-0
+head(utilMatrixNorm) %>% kable() %>% kable_styling() %>% scroll_box(width = "800px", height = "400px")
+rm(itemBiasMatrix,userBiasMatrix,userBias,itemBias)
+```
+
+Once the dataset has been normalized, we are ready to build an SVD model. This normalization will have to be undone for the model to be useful.
+
+#SVD Model
+
+The model is built with base R's SVD function. This calculates the three matrices in the SVD decomposition: user to concept, single values or weights and concept to item matrices. After performing the calculation we see that the data has a given number of single values given by the rank of the matrix.
+
+```{r}
+svdFact<-svd(utilMatrixNorm)
+
+length(svdFact$d)
+```
+
+To build our model we want to reduce the dimension of the data, the number of single values. The idea is that this eliminates the noise in the data and allows us to build a new utility matrix which can be used to predict rating for all user-item combinations, including those missing on the original matrix. We use a chosen number for k, the reduced dimension. In our case we will set it at 80% of the available dimensions.
+
+```{r}
+k<-which(cumsum(svdFact$d)/sum(svdFact$d)>0.8)[1]
+k
+```
+
+##New Utility Matrix
+
+To calculate the new matrix we multiply the SVD resulting matrices after reducing their dimension to the chosen k. To be able to predict with this new matrix we revert the normalization applied to the original data. Once we do this we can see that the matrix now provides rating for all user-item combinations, including those which were missing in the original data. We will generate several models, so we create a function for this.
+
+```{r}
+svdModel<-function(svd,k,baseline) {
+  model<- svd$u[,1:k] %*% diag(svd$d[1:k]) %*% t(svd$v[,1:k])
+  model<-model+baseline
+  model[model<1]<-1
+  model[model>5]<-5
+  return(model)
+}
+```
+
+Now we use the function with the data on hand to generate our model.
+
+```{r}
+newUtilMatrix<-svdModel(svdFact,k,baseline)
+dimnames(newUtilMatrix) <- dimnames(utilMatrixNorm)
+head(data.frame(newUtilMatrix)) %>% kable() %>% kable_styling() %>% scroll_box(width = "800px", height = "400px")
+```
+
+#Using the Model
+
+Now that we have a model for all possible rating, our new matrix, we will explore a couple of ways this can be used in a recommender setting.
+
+##User recommendations
+
+The first way it can be used is to give recommendations to a specific user. For example a user who has already made some reviews and is in our matrix already. For instance we can pick user 400 and use the matrix to produce some recommendations to this individual. This can be a returning costumer to our site. We do this by looking at all the ratings in the matrix for this user and selecting those with the highest ratings. For example below we have decided to present to this user all other items with a ratings of 5.
+
+```{r}
+userReviews<-which(!is.na(utilMatrix[2,]))
+recommendations<-newUtilMatrix[1,which(newUtilMatrix[400,]==5)][-userReviews]
+length(recommendations)
+recommendations
+```
+
+##Concept Query
+
+But what is we have a user who has not entered any reviews? This is a new user to our site who is simple browsing some of our items. In this case we can use our matrix to query items that below to the same concept/topic as the one being browsed by the user and present the ones with the highest rating. For example is the user is looking at the first item in our list, we can recommend the items with the highest rating in the same concept as this item. 
+
+```{r}
+q<-replicate(length(newUtilMatrix[1,]),0)
+q[1]<-5
+conceptAfinity<-q %*% svdFact$v
+which(as.vector(conceptAfinity)==max(as.vector(conceptAfinity)))
+```
+
+#Evaluate Model
+
+Now that we have a model and know how to use it, we should be asking ourselves how good is our model. To determine this we can use RMSE as the model metric, in which the lower this number the better. We start by defining a function for this metric.
+
+```{r}
+rmse<-function(predictedRatings,observedRatings){
+  sqrt(mean((predictedRatings-observedRatings)^2,na.rm=TRUE))
+}
+```
+
+We then split our original matrix in train and test. We split our data in 75% training, 25% test
+
+```{r}
+numberOfTest<-abs(0.25*sum(!is.na(utilMatrix)))
+naIndeces<-which(is.na(utilMatrix))
+testIndeces<-sample((1:length(utilMatrix))[-naIndeces],numberOfTest,replace = F)
+trainIndeces<-(1:length(utilMatrix))[-c(naIndeces,testIndeces)]
+testMatrix<-utilMatrix
+testMatrix[testIndeces]<-NA
+trainMatrix<-utilMatrix
+trainMatrix[trainIndeces]<-NA
+```
+
+New new matrices for both training and test, we build a new model with the training data.
+
+```{r}
+meanTrainMatrix<-mean(trainMatrix,na.rm = T)
+userBiasVector<-unname(rowMeans(trainMatrix,na.rm=T))-meanTrainMatrix
+userBiasMatrix<-matrix(userBiasVector,nrow=nrow(trainMatrix),ncol=ncol(trainMatrix))
+itemBiasVector<-unname(colMeans(trainMatrix,na.rm=T))-meanTrainMatrix
+itemBiasMatrix<-matrix(itemBiasVector,nrow=nrow(trainMatrix),ncol=ncol(trainMatrix),byrow=T)
+traingBaseline<-meanTrainMatrix+userBiasMatrix+itemBiasMatrix
+trainMatrixNorm<-trainMatrix-traingBaseline
+trainMatrixNorm[is.na(trainMatrixNorm)]<-0
+svdFactTrain<-svd(trainMatrixNorm)
+```
+
+From this new model we again select a number of dimensions to use in our model. A before we use 80%.
+
+```{r}
+k<-which(cumsum(svdFactTrain$d)/sum(svdFactTrain$d)>0.8)[1]
+k
+```
+
+Same as before, we can now build our model matrix by multiplying the SVD factorization matrices and eliminating the normalization. From that we can calculate the RMSE using our original test matrix.
+
+```{r}
+trainMatrixModel<-svdModel(svdFactTrain,k,traingBaseline)
+dimnames(trainMatrixModel) <- dimnames(trainMatrixNorm)
+rmse(trainMatrixModel,testMatrix)
+```
+
+This metric can be used to compare this model's performance with other recommenders. But also this metric is dependant on the k we have chosen. So we can also compare the peformance of SVD models with different K values.
+
+```{r}
+ks<-round(c(seq(10,length(svdFactTrain$d),by=length(svdFactTrain$d)/5)),0)
+rmseMatrix<-matrix(NA,nrow=length(ks), ncol=2)
+for (i in 1:length(ks)){
+  print(ks[i])
+  trainMatrix<-svdModel(svdFactTrain,ks[i],traingBaseline)
+  rmseMatrix[i,]<-c(ks[i],rmse(trainMatrix, testMatrix))
+}
+data.frame(rmseMatrix) %>% ggplot(aes(x=X1,y=X2))+geom_line()
+```
+
+#Conclusion and Summary
+
+We have demonstrated how a recommender model can be built from an SVD matrix decomposition of a utility matrix with user and item dating info. We saw how this model can be used to both recommend items to users who have already entered reviews, and to users who are browsing an item in the matrix. We also calculated a metric to measure the performance of the model, and used such metric to show the effect of selecting different dimensions k. We can also see how not necessarily the highest k gives the best results. We certainly need a good number of dimensions, but lower dimensions seem to be better at eliminating some of the noise in the dataset.
+
+Also worth mentioning is the quality of the dataset. Other Amazon rating dataset were first used in this project which required a much larger number of ratings to obtain a good performing model. Due to processing power limitations, this dataset was selected which allowed a good analysis of SVD with a smaller number of ratings.
+
